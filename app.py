@@ -1,6 +1,7 @@
 from backend import (
     chatbot,
     get_all_threads,
+    get_user_threads,
     ingest_rag_document
 )
 
@@ -244,12 +245,15 @@ def resume_hitl_execution(decision):
     interrupted_thread_id = pending_hitl["thread_id"]
 
     # The same thread ID must be used when resuming
+    user_sess = st.session_state.get("user_session_id", "default")
     resume_config = {
         "configurable": {
-            "thread_id": interrupted_thread_id
+            "thread_id": interrupted_thread_id,
+            "session_id": user_sess,
         },
         "metadata": {
-            "thread_id": interrupted_thread_id
+            "thread_id": interrupted_thread_id,
+            "session_id": user_sess,
         },
         "run_name": "hitl_resume_trace",
     }
@@ -712,6 +716,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# Multi-user session isolation: Assign each browser a unique session identifier
+if "user_session_id" not in st.session_state:
+    if "session" in st.query_params and st.query_params["session"]:
+        st.session_state["user_session_id"] = st.query_params["session"]
+    else:
+        new_session = str(uuid.uuid4())[:12]
+        st.session_state["user_session_id"] = new_session
+        st.query_params["session"] = new_session
+
+user_session_id = st.session_state["user_session_id"]
+
+
 # Create message_history when the app runs for the first time
 if "message_history" not in st.session_state:
     st.session_state["message_history"] = []
@@ -722,9 +738,9 @@ if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = generate_thread_id()
 
 
-# Create a list for storing all conversation thread IDs
+# Create a list for storing conversation thread IDs belonging strictly to THIS user session
 if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = get_all_threads()
+    st.session_state["chat_threads"] = get_user_threads(user_session_id)
 
 
 # ========================= HITL ADDED =========================
@@ -1042,7 +1058,8 @@ if submission:
             ):
 
                 ingest_rag_document(
-                    temporary_file_path
+                    temporary_file_path,
+                    thread_id=st.session_state["thread_id"]
                 )
 
             # Display PDF processing confirmation toast
@@ -1117,10 +1134,12 @@ if user_input:
     # LangGraph uses this ID to save and retrieve conversation memory
     CONFIG = {
         "configurable": {
-            "thread_id": st.session_state["thread_id"]
+            "thread_id": st.session_state["thread_id"],
+            "session_id": user_session_id,
         },
         "metadata": {
-            "thread_id": st.session_state["thread_id"]
+            "thread_id": st.session_state["thread_id"],
+            "session_id": user_session_id,
         },
         "run_name": "chat_trace",
     }

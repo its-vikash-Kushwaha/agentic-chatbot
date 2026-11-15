@@ -1,6 +1,7 @@
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -34,35 +35,48 @@ llm = ChatGroq(
 embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
 
 
+def get_db_path(thread_id: str | None = None) -> str:
+    """Return isolated vector store path for a specific thread."""
+    if thread_id:
+        return os.path.join("faiss_db", str(thread_id))
+    return "faiss_db"
 
-def ingest_rag_document(file_path):
-    DB_PATH = "faiss_db"
+
+def ingest_rag_document(file_path: str, thread_id: str | None = None):
+    """Index PDF document into an isolated vector store for this specific thread."""
+    db_path = get_db_path(thread_id)
     loader = PyPDFLoader(file_path)
     docs = loader.load()
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
     vector_store = FAISS.from_documents(chunks, embeddings)
-    vector_store.save_local(DB_PATH)
-    
+    vector_store.save_local(db_path)
 
 
-def get_retriever():
-    DB_PATH = "faiss_db"
-    if not os.path.exists(DB_PATH):
+def get_retriever(thread_id: str | None = None):
+    """Retrieve the vector index for a thread, preventing cross-user data leakage."""
+    db_path = get_db_path(thread_id)
+    if not os.path.exists(db_path):
+        # Fallback to shared faiss_db only if it exists and has an index
+        if not (os.path.exists("faiss_db") and os.path.exists(os.path.join("faiss_db", "index.faiss"))):
+            return None
+        db_path = "faiss_db"
+
+    try:
+        vector_store = FAISS.load_local(
+            folder_path=db_path,
+            embeddings=embeddings,
+            allow_dangerous_deserialization=True
+        )
+
+        retriever = vector_store.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 6}
+        )
+
+        return retriever
+    except Exception:
         return None
-
-    vector_store = FAISS.load_local(
-        folder_path=DB_PATH,
-        embeddings=embeddings,
-        allow_dangerous_deserialization=True
-    )
-
-    retriever = vector_store.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 6}
-    )
-
-    return retriever
 
 
 
@@ -70,7 +84,7 @@ def get_retriever():
 # rag tool
 
 @tool
-def rag_tool(query: str) -> str:
+def rag_tool(query: str, config: RunnableConfig) -> str:
     """
     Search and retrieve information from the user's uploaded PDF document, resume, or CV.
 
@@ -81,10 +95,11 @@ def rag_tool(query: str) -> str:
     Args:
         query: The search query or question to retrieve relevant sections from the document.
     """
-    retriever = get_retriever()
+    thread_id = config.get("configurable", {}).get("thread_id") if config else None
+    retriever = get_retriever(thread_id)
     if retriever is None:
         return (
-            "No document is currently available in the database. "
+            "No document is currently available in this conversation. "
             "Please instruct the user to upload their PDF document using the attachment icon."
         )
 
@@ -330,15 +345,20 @@ class ChatState(TypedDict):
 
 
 # Nodes 1
-def chat_node(state: ChatState):
+def chat_node(state: ChatState, config: RunnableConfig):
     """LLM node that can answer directly or call an appropriate tool."""
 
-    has_uploaded_doc = os.path.exists("faiss_db")
+    thread_id = config.get("configurable", {}).get("thread_id") if config else None
+    db_path = get_db_path(thread_id)
+    has_uploaded_doc = (
+        (db_path and os.path.exists(db_path)) or
+        (os.path.exists("faiss_db") and os.path.exists(os.path.join("faiss_db", "index.faiss")))
+    )
 
     if has_uploaded_doc:
         doc_status = (
             "DOCUMENT STATUS: [ACTIVE]\n"
-            "- A document/resume has been uploaded and indexed in the vector database.\n"
+            "- A document/resume has been uploaded and indexed in the vector database for this conversation.\n"
             "- CRITICAL: Whenever the user asks about their resume, CV, projects, work experience, "
             "education, skills, certifications, contact details, or document contents, you MUST invoke `rag_tool` "
             "to look up the information.\n"
@@ -409,11 +429,36 @@ chatbot = graph.compile(checkpointer=checkpoint)
 
 
 
-# Helper functions for Streamlit frontend
-def get_all_threads():
-    all_threads = set()
-    for ckpt in checkpoint.list(None):
-        all_threads.add(ckpt.config['configurable']['thread_id'])
+# Helper functions for Streamlit frontend with multi-user isolation
+def get_user_threads(session_id: str | None = None) -> list:
+    """
+    Return thread IDs for a specific user session to prevent users from seeing
+    each other's chat histories.
+    """
+    if not session_id:
+        return []
 
-    return list(all_threads)
+    user_threads = []
+    seen = set()
+
+    try:
+        for ckpt in checkpoint.list(None):
+            cfg = ckpt.config.get("configurable", {})
+            metadata = getattr(ckpt, "metadata", {}) or {}
+            ckpt_session = cfg.get("session_id") or metadata.get("session_id")
+
+            if ckpt_session == session_id:
+                tid = cfg.get("thread_id")
+                if tid and tid not in seen:
+                    seen.add(tid)
+                    user_threads.append(tid)
+    except Exception:
+        pass
+
+    return user_threads
+
+
+def get_all_threads(session_id: str | None = None):
+    """Backwards-compatible wrapper that filters by user session."""
+    return get_user_threads(session_id)
 
