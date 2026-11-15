@@ -1,0 +1,27 @@
+# Environment and virtualenvs
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Secrets (pass at runtime via --env-file or docker-compose)
+.env
+
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local databases and runtime state
+chatbot.db*
+faiss_db/
+
+# Temporary and log files
+*.log
+tmp/
